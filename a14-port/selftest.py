@@ -93,8 +93,7 @@ def t_mkboot():
          "--orig", os.path.join(D, "firmware",
                                "cezanne_images_V12.5.11.0.RJNCNXM_20220301.0000.00_11.0_cn",
                                "images", "boot.img"),
-         "--kernel", os.path.join(D, "artifacts", "extracted", "artifacts",
-                                 "x_cezanne-kernel-bpf-2", "kernel", "Image.gz-dtb"),
+         "--kernel", os.path.join(D, "artifacts", "x34", "kernel", "kernel", "Image.gz"),
          "--ramdisk", os.path.join(D, "rd_work", "ramdisk.img"),
          "--out", out],
         capture_output=True, timeout=600)
