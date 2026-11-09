@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# BPF backport: 把 5.10/5.15 的 BPF 能力回合到 4.14
+#
+# 背景（Android 16/17 硬门槛）：
+#   MTK 在 4.14 早期 tag 里的 ALPS05247589 破坏了 BPF arraymap 的
+#   array_map_update_elem 边界检查，memcpy 被静默跳过 → BPF map 写入丢失。
+#   A13 起 Android 的 netbpfload/bpfloader 会加载 BPF 程序做网络过滤，
+#   加载失败或 map 写不进去 → bpfloader 炸 → 无网络 / SystemUI 崩溃循环。
+#
+# 解决路径（三件套，缺一不可）：
+#   ① Import BPF Changes        —— 回合上游 BPF 核心修复（含 arraymap 修复）
+#   ② bpf: sockmap → sk_msg      —— 新版 socket map 实现，A16+ 依赖
+#   ③ sys_clone3                 —— A17 zygote 需要
+#   ④ BTF 补充                   —— A16+ 的 bpfloader 需要内核 BTF
+#
+# 参考实现（免费公开）：
+#   mt6873-dev/android_kernel_xiaomi_mt6885  (cgroup-v2 分支, 2025-08-02)
+#   mk7x7/android_kernel_xiaomi_mt6768        (MT6768 同代 4.14, LTS 4.14.357)
+#
+set -euo pipefail
+
+log() { echo -e "\033[1;36m[bpf]\033[0m $*"; }
+ok()  { echo -e "\033[1;32m[ ok ]\033[0m $*"; }
+warn(){ echo -e "\033[1;33m[warn]\033[0m $*"; }
+
+cd "${KERNEL_DIR:-kernel}"
+# PATCH_DIR 由 build.sh export 传入; 独立跑时给默认值
+PATCH_DIR="${PATCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../patches" 2>/dev/null && pwd)}"
+
+# ── 判定树里是否已有 BPF 关键特性 ───────────────────────────
+# ★ 这些函数在 set -e 下被 if/! 调用, 函数体最后一条命令的退出码
+#   就是函数返回值 —— grep 无匹配返回 1 正是我们要的"没有"语义,
+#   所以这里不能加 || true (加了反而永远返回 0, 判断全错)。
+has_sockmap_skmsg() {
+  grep -q "sk_msg" net/core/filter.c 2>/dev/null
+}
+has_btf_verifier() {
+  grep -q "bpf_prog_attach_btf" kernel/bpf/verifier.c 2>/dev/null
+}
+has_clone3() {
+  grep -q "CONFIG_ARCH_HAS_SYSCALL_WRAPPER" include/uapi/asm-generic/unistd.h 2>/dev/null || true
+  grep -rq "__NR_clone3" arch/arm64/include 2>/dev/null || true
+}
+
+# ── 1. 回合 sys_clone3（A17 zygote 硬需求）────────────────────
+log "检查 sys_clone3"
+if has_clone3; then
+  ok "sys_clone3 已存在"
+else
+  log "回合 sys_clone3（内核 syscall + arm64 入口）"
+  # 需要: kernel/sys.c (SYSCALL_DEFINE), include/linux/syscalls.h,
+  #       arch/arm64/include/asm/unistd.h, arch/arm64/include/uapi/asm/unistd.h,
+  #       arch/arm64/entry/common.c, include/uapi/linux/sched.h (CLONE3 args)
+  if [ -d "$PATCH_DIR/clone3" ]; then
+    for p in "$PATCH_DIR"/clone3/*.patch; do
+      [ -f "$p" ] || continue
+      log "apply $(basename "$p")"
+      git apply --3way "$p" || git apply "$p" || warn "apply 失败: $(basename "$p")"
+    done
+    ok "clone3 patch 应用完成"
+  else
+    warn "未找到 clone3 patch 目录，跳过"
+    warn "（A17 需要它；A16 不强制）"
+  fi
+fi
+
+# ── 2. 回合上游 BPF 核心 (可选)（从 mt6768 同代树取 patch）────────────
+log "检查现有 BPF 能力"
+if has_sockmap_skmsg; then
+  ok "sockmap→sk_msg 已存在"
+else
+  log "回合 sockmap → generic sk_msg interface"
+  # 上游提交: net: bpf, sockmap: convert to generic sk_msg interface
+  # 涉及: net/core/filter.c, net/core/sock_map.c, include/net/bpf.h,
+  #       include/linux/bpf.h, kernel/bpf/sockmap.c
+  APPLY_FAILED=0
+  APPLIED=0
+  BPF_OK=1
+  if [ -d "$PATCH_DIR/mt6768-bpf" ]; then
+    for p in "$PATCH_DIR"/mt6768-bpf/*.patch; do
+      [ -f "$p" ] || continue
+      name=$(basename "$p")
+      # .delete.patch = 删掉原厂文件 (mt6768 已把该实现移到别处)
+      case "$name" in
+        *.delete.patch)
+          target=$(grep -m1 '^--- a/' "$p" | sed 's|^--- a/||')
+          if [ -f "$KERNEL_DIR/$target" ]; then
+            log "delete $target"
+            rm -f "$KERNEL_DIR/$target"
+          else
+            log "delete $target (已不存在, 跳过)"
+          fi
+          continue
+          ;;
+      esac
+      log "apply $name"
+      # 注意: 浅克隆没有 blob, git apply --3way 会报
+      # "repository lacks the necessary blob", 所以直接用普通 apply
+      if git apply "$p" 2>/tmp/ga.txt; then
+        APPLIED=$(( APPLIED + 1 ))
+      else
+        warn "apply 失败: $name"
+        head -3 /tmp/ga.txt | sed 's/^/         /'
+        APPLY_FAILED=$(( APPLY_FAILED + 1 ))
+      fi
+    done
+    log "应用结果: 成功 $APPLIED / 失败 $APPLY_FAILED"
+    if [ "$APPLY_FAILED" -gt 0 ]; then
+      warn "有 $APPLY_FAILED 个 patch 失败 -> 回滚 BPF 部分 (半应用状态比不应用更糟)"
+      git -C "$KERNEL_DIR" checkout -- kernel/bpf include/linux include/uapi include/net net/core kernel/trace 2>/dev/null || true
+      git -C "$KERNEL_DIR" clean -fd -- kernel/bpf include/linux include/uapi include/net net/core kernel/trace 2>/dev/null || true
+      warn "BPF 回合未生效 (clone3 已在前面完成, 不受影响)"
+      BPF_OK=0
+    fi
+    ok "patch 集合应用完成 ($APPLIED 个)"
+  else
+    warn "未找到 mt6768-bpf patch 目录，跳过 sockmap 回合"
+    warn "（A16/A17 需要它；请把 patch 集放到 \$PATCH_DIR/mt6768-bpf/）"
+  fi
+fi
+
+# ── 3. BTF 支持开关（bpfloader 需要内核导出 BTF）─────────────
+# 注意: 这里不能直接写 .config —— 脚本运行在 defconfig 之前, .config 尚不存在
+# (写了也无效, 且会刷出 "grep: .config: No such file or directory" 噪音)。
+# BTF/PAHOLE 等 config 统一由 build.sh 在 defconfig 之后设置。
+log "BTF 配置稍后由 build.sh 统一设置 (当前阶段 .config 尚未生成)"
+
+# PAHOLE 需要 pahole 工具
+if ! command -v pahole >/dev/null 2>&1; then
+  warn "未安装 pahole，BTF 将无法生成（4.19+ 内核的 BTF 需要 pahole >= 1.16）"
+  warn "安装: sudo apt-get install -y dwarves"
+fi
+
+ok "BPF 回合阶段完成"
+
+# ── 4. 报告当前状态 ──────────────────────────────────────────
+# BUILD_INFO 可能未定义 (由 build.sh 传入), 给个默认值避免 set -u 退出
+BUILD_INFO="${BUILD_INFO:-/dev/null}"
+echo "" >> "$BUILD_INFO" 2>/dev/null || true
+log "BPF 能力现状："
+echo "  sockmap/sk_msg : $(has_sockmap_skmsg && echo YES || echo NO)"
+echo "  BTF verifier   : $(has_btf_verifier && echo YES || echo NO)"
+echo "  sys_clone3     : $(has_clone3 && echo YES || echo NO)"

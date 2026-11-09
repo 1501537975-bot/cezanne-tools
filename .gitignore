@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+rd_files/
+rd_stock/
+out_boot/
+a17_super/
